@@ -1,0 +1,214 @@
+<!--
+  UniFi OS CEF classification rules (paired with unifi_cef_decoders.xml).
+  Keyed off the decoded field unifi.product (set by EITHER decoder shape A or B) rather than
+  decoded_as, since two decoder parents now feed these rules.
+  Levels: 100301 base = 3 (visible; tune once the continuous feed volume is known);
+          100302 SIEM "Test Syslog" = 0; 100305 firewall block/deny = 5 (below the level-10
+          triage gate); 100306 IPS/IDS/threat = 10 (reaches triage).
+  The firewall/IPS keyword sets are forward-looking guesses; tune against real CEF samples.
+-->
+<group name="unifi,unifi_cef,syslog,">
+
+  <rule id="100301" level="3">
+    <field name="unifi.product" type="pcre2">^UniFi</field>
+    <description>UniFi: $(unifi.event) [$(unifi.product) $(unifi.devver)]</description>
+    <group>unifi_event,</group>
+  </rule>
+
+  <rule id="100302" level="0">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">^Test Syslog$</field>
+    <description>UniFi: SIEM test event (suppressed).</description>
+  </rule>
+
+  <rule id="100305" level="5">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">(?i)(block|drop|deny|denied|reject|firewall)</field>
+    <description>UniFi firewall: $(unifi.event)</description>
+    <group>unifi_firewall,</group>
+  </rule>
+
+  <rule id="100306" level="10">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">(?i)(threat|malware|ips|ids|intrusion|signature|exploit|botnet|c2|virus)</field>
+    <description>UniFi IPS/IDS threat: $(unifi.event)</description>
+    <group>unifi_ips,ids,</group>
+  </rule>
+
+  <!-- ===== UniFi OS admin-plane events (keyed off CEF sigid) =====
+       Observed live: sigid 1000 = "Admin Accessed UniFi OS"; sigid 1005 = configuration
+       change (e.g. SSH access toggled). Both arrive via the same CEF feed and only hit
+       base rule 100301 at L3. Surface them: admin access L5 (visible), config change L8
+       (security-relevant, kept below the triage gate to avoid noise on routine admin work). -->
+  <rule id="100307" level="8">
+    <if_sid>100301</if_sid>
+    <field name="unifi.sigid">^1005$</field>
+    <description>UniFi OS: administrator configuration change — $(unifi.event)</description>
+    <group>unifi_admin,config_changed,</group>
+    <mitre><id>T1562.007</id></mitre>
+  </rule>
+
+  <rule id="100308" level="5">
+    <if_sid>100301</if_sid>
+    <field name="unifi.sigid">^1000$</field>
+    <description>UniFi OS: administrator console access — $(unifi.event)</description>
+    <group>unifi_admin,authentication_success,</group>
+  </rule>
+
+  <!-- ===== UniFi Network IPS/IDS threat detections (CEF, rich-decoded) =====
+       Chains off the generic threat rule 100306. The threat decoder sets unifi.policyType,
+       unifi.act, unifi.ipsSignature, unifi.risk, etc. Blocked = mitigated (L10, still
+       triaged given rarity); detected-but-not-blocked = active intrusion (L12). If the
+       rich decoder didn't match (variant event), 100306 alone still fires at L10. -->
+  <rule id="100309" level="10">
+    <if_sid>100306</if_sid>
+    <field name="unifi.policyType">IDS/IPS</field>
+    <field name="unifi.act">^blocked$</field>
+    <description>UniFi IPS/IDS BLOCKED [$(unifi.risk)]: $(unifi.ipsSignature) ($(unifi.proto)/$(unifi.dpt))</description>
+    <group>ids,unifi_ips,intrusion_detection,</group>
+  </rule>
+  <rule id="100310" level="12">
+    <if_sid>100306</if_sid>
+    <field name="unifi.policyType">IDS/IPS</field>
+    <field name="unifi.act" negate="yes">^blocked$</field>
+    <description>UniFi IPS/IDS DETECTED (not blocked) [$(unifi.risk)]: $(unifi.ipsSignature) ($(unifi.proto)/$(unifi.dpt))</description>
+    <group>ids,unifi_ips,intrusion_detection,</group>
+  </rule>
+
+  <!-- Suppress UniFi Protect physical-security camera/sensor events (motion, sensorMotion,
+       sensorOpened, sensorClosed, sensorExtremeValues, deviceConnected, deviceDisconnected).
+       These are NOT cyber-security events — they are camera/IoT sensor triggers from
+       UniFi Protect 7.1.76. They constitute 98% of the CEF feed (829/846 events/7d) and
+       appear at L3 in the alert index, corrupting all volume metrics and searches.
+       De-rate to L1 (auditable in archives, not indexed). UniFi OS/Network events are
+       unaffected. -->
+  <rule id="100315" level="1">
+    <if_sid>100301</if_sid>
+    <field name="unifi.product" type="pcre2">^UniFi Protect$</field>
+    <description>UniFi Protect camera/sensor event (physical security, not cyber — suppressed)</description>
+    <group>unifi_protect,</group>
+  </rule>
+
+  <!-- ===== UniFi NAS (UNAS Pro) backup events =====
+       The UNAS Pro sends CEF with product "UniFi OS" (device <UNAS IP>, UNASPRO); the
+       unifi-cef decoder already parses it — confirmed with wazuh-logtest. A backup event
+       therefore lands on base rule 100301 at L3: visible, but BELOW the triage gate, so a
+       FAILED backup would never page. These children re-rate backup outcomes, keyed on
+       unifi.event, following the same chain-off-100301 pattern as 100305/100306.
+       Levels: failure/deletion L8 (indexed + on dashboards, below the gate — bump to L10 to
+       page); routine success/start L2 (suppressed). Patterns are keyword-based so they
+       survive minor EventName variation.
+       VALIDATE against a real backup line: confirm the keyword is in unifi.event (the CEF
+       EventName). If it appears only in the CEF extension (e.g. UNIFIcategory=backup, like
+       Protect uses UNIFIcategory=iot), switch the field to <field name="unifi.ext">. -->
+  <rule id="100316" level="8">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">(?i)(backup.*(fail|error|abort|unsuccessful|incomplete)|(fail|error|abort).*backup)</field>
+    <description>UniFi NAS: backup FAILED ($(unifi.event)) — no recovery point created</description>
+    <group>unifi_nas,backup,</group>
+    <mitre><id>T1490</id></mitre>
+  </rule>
+  <rule id="100317" level="8">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">(?i)(backup.*(delet|remov|purg|prun|expir)|(delet|remov|purg).*backup)</field>
+    <description>UniFi NAS: backup deleted/removed ($(unifi.event)) — verify retention vs anti-recovery</description>
+    <group>unifi_nas,backup,</group>
+    <mitre><id>T1485</id></mitre>
+    <mitre><id>T1490</id></mitre>
+  </rule>
+  <rule id="100318" level="2">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">(?i)backup.*(complet|finish|creat|start|done|schedul)</field>
+    <description>UniFi NAS: routine backup ($(unifi.event)) — success/start (suppressed)</description>
+    <group>unifi_nas,backup,</group>
+  </rule>
+
+  <!-- Honeypot trigger (sigId 202): something connected to a decoy IP. Near-zero FP =
+       high signal (recon / lateral movement / compromised host). L12 -> triage. Chains
+       off base 100301; the threat/firewall keyword rules don't match "Honeypot". -->
+  <rule id="100311" level="12">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">(?i)honeypot</field>
+    <description>UniFi Honeypot triggered by $(unifi.clientMac) — possible recon/lateral movement</description>
+    <group>honeypot,ids,intrusion_detection,</group>
+    <mitre><id>T1046</id></mitre>
+  </rule>
+
+  <!-- ===== UniFi Network firewall blocks (sigId 203, policyType Firewall) =====
+       External inbound blocks are constant internet-scan background noise -> de-rate to L2
+       (still counted by the correlation engine, but NOT indexed/triaged). Outbound blocks
+       (an internal host blocked from leaving = possible compromise/policy violation) -> L7.
+       One external src hammering us -> a single L8 scan alert via frequency, instead of
+       thousands of events. src/dst decoded as canonical srcip/dstip so MISP IP-IOC rules
+       100210/100211 auto-flag known-bad blocked IPs (L12). Levels/threshold tunable. -->
+  <rule id="100312" level="2">
+    <if_sid>100305</if_sid>
+    <field name="unifi.policyType">^Firewall$</field>
+    <field name="unifi.direction">^incoming$</field>
+    <field name="unifi.srcZone">^External$</field>
+    <description>UniFi firewall: external inbound block $(srcip) to $(dstip):$(dstport) (noise, suppressed)</description>
+    <group>unifi_firewall,firewall_drop,</group>
+  </rule>
+  <rule id="100313" level="7">
+    <if_sid>100305</if_sid>
+    <field name="unifi.policyType">^Firewall$</field>
+    <field name="unifi.direction">^outgoing$</field>
+    <description>UniFi firewall: OUTBOUND block from $(srcip) to $(dstip):$(dstport) — internal host blocked</description>
+    <group>unifi_firewall,firewall_drop,</group>
+  </rule>
+  <!-- L8 -> L10. 20 drops in 120s from one source is strong scan evidence;
+       L8 sat below the L10 Shuffle/Grok/Telegram triage gate so scans were never paged. -->
+  <rule id="100314" level="10" frequency="20" timeframe="120">
+    <if_matched_sid>100312</if_matched_sid>
+    <same_source_ip />
+    <description>UniFi firewall: repeated external blocks from $(srcip) — possible scan/targeted activity</description>
+    <group>unifi_firewall,recon,</group>
+    <mitre><id>T1046</id></mitre>
+  </rule>
+
+  <!-- ===== UniFi gateway iptables firewall syslog (the ~240/min non-CEF stream) =====
+       Decoded by unifi-fw (was "No decoder matched"). Default L1 so the allow/permit flood
+       is captured-but-suppressed; drops -> L2 (still suppressed, but tagged + counted);
+       outbound drops (internal host blocked from leaving) -> L7; one src hammering blocks
+       -> L8 scan via frequency. srcip/dstip are canonical -> MISP rules 100210/211 auto-flag
+       known-bad at L12. (Reduce volume at source by disabling 'log' on UniFi ALLOW rules.) -->
+  <rule id="100320" level="1">
+    <decoded_as>unifi-fw</decoded_as>
+    <description>UniFi firewall [$(unifi.fw_chain)/$(unifi.fw_action)]: $(srcip) -> $(dstip) ($(unifi.fw_proto)/$(dstport)) "$(unifi.fw_policy)"</description>
+    <group>unifi_firewall,</group>
+  </rule>
+  <rule id="100321" level="2">
+    <if_sid>100320</if_sid>
+    <field name="unifi.fw_action">^D$</field>
+    <description>UniFi firewall DROP [$(unifi.fw_chain)]: $(srcip) -> $(dstip):$(dstport) (suppressed)</description>
+    <group>unifi_firewall,firewall_drop,</group>
+  </rule>
+  <rule id="100322" level="7">
+    <if_sid>100321</if_sid>
+    <field name="unifi.fw_chain" type="pcre2">^LOCAL_</field>
+    <description>UniFi firewall: OUTBOUND drop $(srcip) -> $(dstip):$(dstport) — internal host blocked from leaving</description>
+    <group>unifi_firewall,firewall_drop,</group>
+  </rule>
+  <!-- L8 -> L10 (see 100314). NOTE: this only sees traffic crossing the UniFi
+       gateway; same-subnet scans (two hosts on the same VLAN) stay on the L2 switch
+       and never reach here — host-side rule 200166 + UniFi honeypot cover that gap. -->
+  <rule id="100323" level="10" frequency="20" timeframe="120">
+    <if_matched_sid>100321</if_matched_sid>
+    <same_source_ip />
+    <description>UniFi firewall: repeated drops from $(srcip) — possible scan/targeted activity</description>
+    <group>unifi_firewall,recon,</group>
+    <mitre><id>T1046</id></mitre>
+  </rule>
+
+  <!-- Off-hours VPN connection alerting. Level 8 (below triage gate = L10) to avoid
+       paging on routine VPN logins. The VPN event has unifi.event='VPN Client Connected'
+       and unifi.suser for the username. -->
+  <rule id="100360" level="8">
+    <if_sid>100301</if_sid>
+    <field name="unifi.event" type="pcre2">^VPN Client Connected$</field>
+    <description>UniFi VPN: $(unifi.event) by $(srcuser) from $(srcip) — verify expected user/time</description>
+    <group>unifi_vpn,authentication_success,</group>
+    <mitre><id>T1133</id></mitre>
+  </rule>
+
+</group>

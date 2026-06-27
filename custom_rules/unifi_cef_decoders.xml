@@ -1,0 +1,112 @@
+<!--
+  UniFi OS "SIEM Server" CEF feed -> Wazuh decoder.
+  Source: UDM SE <GATEWAY IP>, Settings > Control Plane > Integrations > Activity Logging (SIEM Server).
+  Wire format (after syslog header): CEF:0|Ubiquiti|<product>|<ver>|<sigId>|<EventName>|<cefSev>|<k=v ...>
+  Products seen: "UniFi OS", "UniFi Protect", "UniFi Network".
+
+  Two delivery shapes observed (depends on how the syslog pre-decoder splits the header):
+    A) "CEF:" stays in the message     -> matched via prematch on "Ubiquiti|UniFi".
+    B) pre-decoder extracts program_name="CEF" (the shape wazuh-remoted actually delivers)
+                                       -> matched via <program_name>CEF</program_name>.
+  Both extract the same fields. PCRE2 is required (CEF delimits with literal '|').
+  Wazuh evaluates only the FIRST matching child, so all header fields are one regex; the
+  variable key=val extension is kept as a blob (unifi.ext) that rules pattern-match.
+-->
+
+<!-- IPS/IDS threat events ("UniFi Network", e.g. sigId 201 "Threat Detected and Blocked")
+     carry rich extension fields. These threat children are listed BEFORE the generic
+     -fields children so they're tried first; non-threat events lack the UNIFIipsSignature
+     anchor, fail this regex, and fall through to the generic header-only child. From a
+     real sample. proto/spt/dpt/act/risk/policyType/signature/id/msg are
+     present for IPS threats regardless of internal vs external source. -->
+
+<!-- Shape A: CEF: preserved in the message -->
+<decoder name="unifi-cef">
+  <prematch type="pcre2">Ubiquiti\|UniFi</prematch>
+</decoder>
+<decoder name="unifi-cef-threat">
+  <parent>unifi-cef</parent>
+  <prematch type="pcre2">UNIFIipsSignature=</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bproto=(\S+).*?\bspt=(\d+).*?\bdpt=(\d+).*?\bact=(\S+).*?UNIFIrisk=(\S+).*?UNIFIpolicyType=(\S+).*?UNIFIipsSignature=(.+?) UNIFIipsSignatureId=(\d+).*?\bmsg=(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.proto, unifi.spt, unifi.dpt, unifi.act, unifi.risk, unifi.policyType, unifi.ipsSignature, unifi.ipsSignatureId, unifi.msg</order>
+</decoder>
+<decoder name="unifi-cef-honeypot">
+  <parent>unifi-cef</parent>
+  <prematch type="pcre2">(?i)Honeypot</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?UNIFIclientMac=(\S+).*?\bmsg=(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.clientMac, unifi.msg</order>
+</decoder>
+<decoder name="unifi-cef-firewall">
+  <parent>unifi-cef</parent>
+  <prematch type="pcre2">UNIFIpolicyType=Firewall</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bproto=(\S+).*?\bspt=(\d+).*?\bdpt=(\d+).*?\bact=(\S+).*?UNIFIpolicyType=(\S+).*?UNIFIdirection=(\S+).*?\bsrc=(\S+).*?\bdst=(\S+).*?UNIFIsrcZone=(\S+).*?\bmsg=(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.proto, srcport, dstport, unifi.act, unifi.policyType, unifi.direction, srcip, dstip, unifi.srcZone, unifi.msg</order>
+</decoder>
+<!-- Shape A: admin-audit sigid 544 (Network Accessed — admin console login).
+     Anchored on UNIFIaccessMethod= so it takes priority over unifi-cef-fields.
+     Extracts admin username (UNIFIadmin=) and src IP into canonical srcuser/srcip.
+     Per audit (dec-unifi-cef-audit-vpn-srcip-missing). -->
+<decoder name="unifi-cef-netaccess">
+  <parent>unifi-cef</parent>
+  <prematch type="pcre2">\bUNIFIaccessMethod=</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bUNIFIadmin=(\S+).*?\bsrc=(\S+)</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, srcuser, srcip</order>
+</decoder>
+<!-- Shape A: VPN sigid 520 (VPN Client Connected).
+     Anchored on UNIFIcategory=VPN. Extracts src WAN IP + VPN username. -->
+<decoder name="unifi-cef-vpn">
+  <parent>unifi-cef</parent>
+  <prematch type="pcre2">\bUNIFIcategory=VPN\b</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bsrc=(\S+).*?\bsuser=(\S+)</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, srcip, srcuser</order>
+</decoder>
+<!-- FALLBACK — must remain last among shape-A children (no prematch = catches all). -->
+<decoder name="unifi-cef-fields">
+  <parent>unifi-cef</parent>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.ext</order>
+</decoder>
+
+<!-- Shape B: pre-decoder extracted program_name="CEF" (the shape wazuh-remoted delivers) -->
+<decoder name="unifi-cef-pn">
+  <program_name>^CEF$</program_name>
+</decoder>
+<decoder name="unifi-cef-pn-threat">
+  <parent>unifi-cef-pn</parent>
+  <prematch type="pcre2">UNIFIipsSignature=</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bproto=(\S+).*?\bspt=(\d+).*?\bdpt=(\d+).*?\bact=(\S+).*?UNIFIrisk=(\S+).*?UNIFIpolicyType=(\S+).*?UNIFIipsSignature=(.+?) UNIFIipsSignatureId=(\d+).*?\bmsg=(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.proto, unifi.spt, unifi.dpt, unifi.act, unifi.risk, unifi.policyType, unifi.ipsSignature, unifi.ipsSignatureId, unifi.msg</order>
+</decoder>
+<decoder name="unifi-cef-pn-honeypot">
+  <parent>unifi-cef-pn</parent>
+  <prematch type="pcre2">(?i)Honeypot</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?UNIFIclientMac=(\S+).*?\bmsg=(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.clientMac, unifi.msg</order>
+</decoder>
+<decoder name="unifi-cef-pn-firewall">
+  <parent>unifi-cef-pn</parent>
+  <prematch type="pcre2">UNIFIpolicyType=Firewall</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bproto=(\S+).*?\bspt=(\d+).*?\bdpt=(\d+).*?\bact=(\S+).*?UNIFIpolicyType=(\S+).*?UNIFIdirection=(\S+).*?\bsrc=(\S+).*?\bdst=(\S+).*?UNIFIsrcZone=(\S+).*?\bmsg=(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.proto, srcport, dstport, unifi.act, unifi.policyType, unifi.direction, srcip, dstip, unifi.srcZone, unifi.msg</order>
+</decoder>
+<!-- Shape B: admin-audit sigid 544 (Network Accessed — admin console login).
+     Per audit (dec-unifi-cef-audit-vpn-srcip-missing). -->
+<decoder name="unifi-cef-pn-netaccess">
+  <parent>unifi-cef-pn</parent>
+  <prematch type="pcre2">\bUNIFIaccessMethod=</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bUNIFIadmin=(\S+).*?\bsrc=(\S+)</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, srcuser, srcip</order>
+</decoder>
+<!-- Shape B: VPN sigid 520 (VPN Client Connected). -->
+<decoder name="unifi-cef-pn-vpn">
+  <parent>unifi-cef-pn</parent>
+  <prematch type="pcre2">\bUNIFIcategory=VPN\b</prematch>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|.*?\bsrc=(\S+).*?\bsuser=(\S+)</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, srcip, srcuser</order>
+</decoder>
+<!-- FALLBACK — must remain last among shape-B children (no prematch = catches all). -->
+<decoder name="unifi-cef-pn-fields">
+  <parent>unifi-cef-pn</parent>
+  <regex type="pcre2">Ubiquiti\|([^|]+)\|([^|]+)\|([^|]*)\|([^|]+)\|(\d+)\|(.*)$</regex>
+  <order>unifi.product, unifi.devver, unifi.sigid, unifi.event, unifi.cefsev, unifi.ext</order>
+</decoder>
