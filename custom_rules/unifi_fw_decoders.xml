@@ -1,0 +1,28 @@
+<!--
+  UniFi gateway iptables/netfilter firewall syslog -> Wazuh.
+  This is the standard (NON-CEF) firewall LOG stream the UDM forwards over udp/514, e.g.:
+    <13><TIMESTAMP> DM DM [WAN_LOCAL-D-10005] DESCR="Block All" IN=eth8 OUT= MAC=...
+        SRC=<EXTERNAL SRC IP> DST=<WAN IP> ... PROTO=TCP SPT=41241 DPT=3749 SYN ...
+  ~240 msg/min — previously "No decoder matched" (silently dropped). The [ZONE_ZONE-X-NNN]
+  tag encodes the firewall chain (zone pair) + action letter X = A(ccept)/D(rop)/R(eject).
+  SRC/DST/SPT/DPT decode into canonical srcip/dstip/srcport/dstport so the MISP IP-IOC rules
+  100210/100211 auto-flag known-bad IPs, and same_source_ip frequency rules work.
+-->
+<decoder name="unifi-fw">
+  <prematch type="pcre2">\[[A-Z_]+-[ADR]-\d+\] DESCR=</prematch>
+</decoder>
+
+<!-- L4 (TCP/UDP) — has SPT/DPT. prematch routes it; childless extractor. -->
+<decoder name="unifi-fw-l4">
+  <parent>unifi-fw</parent>
+  <prematch type="pcre2">\bSPT=\d+</prematch>
+  <regex type="pcre2">\[([A-Z_]+)-([ADR])-\d+\] DESCR="([^"]*)".*?\bSRC=(\S+)\s+DST=(\S+).*?\bPROTO=(\S+).*?\bSPT=(\d+)\s+DPT=(\d+)</regex>
+  <order>unifi.fw_chain, unifi.fw_action, unifi.fw_policy, srcip, dstip, unifi.fw_proto, srcport, dstport</order>
+</decoder>
+
+<!-- non-L4 (ICMP/other) — no ports. fallback (no prematch), tried after the L4 child. -->
+<decoder name="unifi-fw-base">
+  <parent>unifi-fw</parent>
+  <regex type="pcre2">\[([A-Z_]+)-([ADR])-\d+\] DESCR="([^"]*)".*?\bSRC=(\S+)\s+DST=(\S+).*?\bPROTO=(\S+)</regex>
+  <order>unifi.fw_chain, unifi.fw_action, unifi.fw_policy, srcip, dstip, unifi.fw_proto</order>
+</decoder>
